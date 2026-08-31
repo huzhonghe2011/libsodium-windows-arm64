@@ -1,0 +1,292 @@
+name: Build libsodium Windows ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      libsodium_ref:
+        description: "Upstream libsodium branch, tag, or commit"
+        required: true
+        default: "stable"
+        type: string
+      zig_version:
+        description: "Pinned Zig version used for this build"
+        required: true
+        default: "0.15.2"
+        type: string
+  push:
+    tags:
+      - "libsodium-*"
+
+concurrency:
+  group: "libsodium-arm64-${{ github.ref }}"
+  cancel-in-progress: false
+
+jobs:
+  build-test-package:
+    name: Build and test on Windows ARM64
+    runs-on: windows-11-arm
+
+    permissions:
+      contents: read
+
+    env:
+      UPSTREAM_REPOSITORY: jedisct1/libsodium
+      INPUT_LIBSODIUM_REF: ${{ inputs.libsodium_ref }}
+      EVENT_NAME: ${{ github.event_name }}
+      REF_NAME: ${{ github.ref_name }}
+      WORKSPACE: ${{ github.workspace }}
+
+    outputs:
+      upstream_ref: ${{ steps.ref.outputs.upstream_ref }}
+      safe_ref: ${{ steps.ref.outputs.safe_ref }}
+      upstream_commit: ${{ steps.commit.outputs.sha }}
+      zig_version: ${{ steps.zig.outputs.version }}
+      zip_name: ${{ steps.archive.outputs.zip_name }}
+      artifact_name: ${{ steps.archive.outputs.artifact_name }}
+
+    steps:
+      - name: Checkout builder repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve upstream ref
+        id: ref
+        shell: pwsh
+        run: |
+          if ($env:EVENT_NAME -eq "push") {
+            $tag = $env:REF_NAME
+            if (-not $tag.StartsWith("libsodium-")) {
+              throw "Release tag must start with libsodium-"
+            }
+            $upstreamRef = $tag.Substring("libsodium-".Length)
+          } else {
+            $upstreamRef = $env:INPUT_LIBSODIUM_REF
+          }
+
+          if ([string]::IsNullOrWhiteSpace($upstreamRef)) {
+            throw "Upstream ref is empty"
+          }
+
+          # Use the original value for git checkout, but only a restricted
+          # representation for filenames and artifact names.
+          $safeRef = $upstreamRef -replace '[^A-Za-z0-9._-]', '_'
+          if ([string]::IsNullOrWhiteSpace($safeRef)) {
+            throw "Unable to derive a safe artifact name from upstream ref"
+          }
+
+          "upstream_ref=$upstreamRef" >> $env:GITHUB_OUTPUT
+          "safe_ref=$safeRef" >> $env:GITHUB_OUTPUT
+          Write-Host "Upstream ref: $upstreamRef"
+          Write-Host "Safe ref: $safeRef"
+
+      - name: Checkout official libsodium upstream
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ steps.ref.outputs.upstream_ref }}
+          path: upstream
+          persist-credentials: false
+
+      - name: Resolve upstream commit
+        id: commit
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          $commit = (git rev-parse HEAD).Trim()
+          "sha=$commit" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved libsodium commit: $commit"
+
+      - name: Resolve Zig version
+        id: zig
+        shell: pwsh
+        env:
+          INPUT_ZIG_VERSION: ${{ inputs.zig_version }}
+        run: |
+          if ($env:EVENT_NAME -eq "push") {
+            # Release builds use the repository-pinned stable version.
+            $version = "0.15.2"
+          } else {
+            $version = $env:INPUT_ZIG_VERSION
+          }
+
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw "Zig version is empty"
+          }
+
+          # Keep setup input conservative. This intentionally rejects arbitrary
+          # shell-like text and supports normal stable/dev version strings.
+          if ($version -notmatch '^[0-9A-Za-z.+_-]+$') {
+            throw "Unexpected Zig version format"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Host "Requested Zig version: $version"
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Show environment
+        shell: pwsh
+        run: |
+          Write-Host "Runner arch: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "Zig: $(zig version)"
+          if ($env:PROCESSOR_ARCHITECTURE -ne "ARM64") {
+            throw "Expected native ARM64 Windows runner"
+          }
+
+      - name: Inspect Zig and upstream build configuration
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          Write-Host "Zig executable: $((Get-Command zig).Source)"
+          Write-Host "Zig version: $(zig version)"
+          Write-Host "Upstream commit: $(git rev-parse HEAD)"
+          Write-Host "Available build options:"
+          zig build --help
+
+      - name: Build libsodium for Windows ARM64
+        working-directory: upstream
+        shell: pwsh
+        env:
+          ZIG_BACKTRACE: "1"
+        run: |
+          zig build `
+            -Dtarget=aarch64-windows `
+            -Doptimize=ReleaseFast `
+            -Dstatic=true `
+            -Dshared=true `
+            -Dtest=false `
+            --prefix "$env:WORKSPACE\out"
+
+      - name: Run upstream tests natively on ARM64
+        working-directory: upstream
+        shell: pwsh
+        run: |
+          zig build test `
+            -Dtarget=aarch64-windows `
+            -Doptimize=ReleaseFast
+
+      - name: Package with upstream license
+        shell: pwsh
+        env:
+          UPSTREAM_REF: ${{ steps.ref.outputs.upstream_ref }}
+          UPSTREAM_COMMIT: ${{ steps.commit.outputs.sha }}
+        run: |
+          ./scripts/package.ps1 `
+            -BuildRoot "$env:WORKSPACE\out" `
+            -UpstreamRoot "$env:WORKSPACE\upstream" `
+            -OutputDir "$env:WORKSPACE\package\libsodium-windows-arm64" `
+            -UpstreamRef "$env:UPSTREAM_REF" `
+            -UpstreamCommit "$env:UPSTREAM_COMMIT"
+
+      - name: Verify license is present
+        shell: pwsh
+        run: |
+          $license = "$env:WORKSPACE\package\libsodium-windows-arm64\LICENSE.libsodium"
+          if (-not (Test-Path $license)) {
+            throw "LICENSE.libsodium is missing; refusing to publish."
+          }
+
+      - name: Create ZIP and checksums
+        id: archive
+        shell: pwsh
+        env:
+          SAFE_REF: ${{ steps.ref.outputs.safe_ref }}
+        run: |
+          $zipName = "libsodium-$env:SAFE_REF-windows-arm64.zip"
+          $zipPath = Join-Path $env:WORKSPACE $zipName
+          $artifactName = "libsodium-$env:SAFE_REF-windows-arm64"
+
+          Compress-Archive `
+            -Path "$env:WORKSPACE\package\libsodium-windows-arm64" `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal
+
+          $hash = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content "$env:WORKSPACE\SHA256SUMS.txt" -Encoding ascii
+
+          "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+          "zip_path=$zipPath" >> $env:GITHUB_OUTPUT
+          "artifact_name=$artifactName" >> $env:GITHUB_OUTPUT
+
+          Get-ChildItem -Recurse "$env:WORKSPACE\package\libsodium-windows-arm64"
+          Get-Content "$env:WORKSPACE\SHA256SUMS.txt"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.archive.outputs.artifact_name }}
+          path: |
+            ${{ steps.archive.outputs.zip_path }}
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish unofficial GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/libsodium-')
+    needs: build-test-package
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ARTIFACT_NAME: ${{ needs.build-test-package.outputs.artifact_name }}
+      ZIP_NAME: ${{ needs.build-test-package.outputs.zip_name }}
+      UPSTREAM_REF: ${{ needs.build-test-package.outputs.upstream_ref }}
+      UPSTREAM_COMMIT: ${{ needs.build-test-package.outputs.upstream_commit }}
+      ZIG_VERSION: ${{ needs.build-test-package.outputs.zig_version }}
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Download build artifact from this workflow run
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir release-assets
+
+          test -f "release-assets/$ZIP_NAME"
+          test -f "release-assets/SHA256SUMS.txt"
+
+      - name: Create unofficial release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          ## Unofficial Windows ARM64 build
+
+          **This is not an official libsodium release or official distribution file.**
+          It is a third-party binary built by this repository from the official libsodium source.
+
+          - Upstream: https://github.com/jedisct1/libsodium
+          - Upstream ref: \`$UPSTREAM_REF\`
+          - Upstream commit: \`$UPSTREAM_COMMIT\`
+          - Target: \`aarch64-windows\`
+          - Zig: \`$ZIG_VERSION\`
+          - Build: ReleaseFast, static + shared
+          - Validation: upstream tests executed natively on Windows ARM64
+
+          The binary archive contains the upstream libsodium ISC license as
+          \`LICENSE.libsodium\`.
+
+          For official libsodium releases and security information, use:
+          https://github.com/jedisct1/libsodium
+          EOF
+
+          gh release create "$RELEASE_TAG" \
+            "release-assets/$ZIP_NAME" \
+            "release-assets/SHA256SUMS.txt" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RELEASE_TAG (unofficial Windows ARM64 build)" \
+            --notes-file release-notes.md

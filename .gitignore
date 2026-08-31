@@ -1,0 +1,13 @@
+# Local build/output
+out/
+dist/
+package/
+zig-out/
+.zig-cache/
+zig-cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

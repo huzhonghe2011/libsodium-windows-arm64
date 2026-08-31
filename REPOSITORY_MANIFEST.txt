@@ -1,0 +1,9 @@
+.github/dependabot.yml
+.github/workflows/build.yml
+.gitignore
+LICENSE
+README.md
+SECURITY.md
+THIRD_PARTY_NOTICES.md
+scripts/package.ps1
+REPOSITORY_MANIFEST.txt
